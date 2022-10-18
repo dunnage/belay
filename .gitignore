@@ -27,3 +27,5 @@
 /checkouts
 /classes
 /target
+/.idea
+/.clj-kondo/.cache

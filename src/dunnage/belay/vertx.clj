@@ -133,14 +133,24 @@
                                                 (.setStatusCode response (int status))
                                                 (run!
                                                   (fn [header]
-                                                    (.putHeader response
-                                                                (key header)
-                                                                (.iterator (Arrays/stream (.split (val header) ",")))))
+                                                    (let [v (val header)]
+                                                      (if (sequential? v)
+                                                        (run!
+                                                          (fn [v]
+                                                            (.putHeader response
+                                                                        (key header)
+                                                                        v))
+                                                          v)
+                                                        (.putHeader response
+                                                                    (key header)
+                                                                    v))))
                                                   headers)
                                                 (if body
                                                   (.write response body)
                                                   (.end response)))
-                                     raise (fn [exception])]
+                                     raise (fn [exception]
+                                             (.setStatusCode response 500)
+                                             (.end response))]
                                  (request-handler ring-request respond raise)))) )
           invalid-requesthandler
           (.invalidRequestHandler (reify Handler

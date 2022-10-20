@@ -30,3 +30,4 @@
 /.idea
 /.clj-kondo/.cache
 /belay.iml
+/.clj-kondo/*/*/config.edn

@@ -8,14 +8,25 @@
                    Future MultiMap Context)
     (io.vertx.core.http
       HttpClient HttpClientOptions HttpClientRequest HttpClientResponse RequestOptions
-      HttpServer HttpServerRequest HttpServerResponse HttpServerOptions ServerWebSocket)
+      HttpServer HttpServerRequest HttpServerResponse HttpServerOptions ServerWebSocket WebSocket WebSocketConnectOptions WebSocketFrame)
     (io.vertx.core.json JsonObject)
     (io.vertx.core.net SocketAddress)
-    (java.util Arrays Iterator Map$Entry)
+    (java.util Arrays Iterator Map Map$Entry)
     (java.util.function Function)))
 
-(defn json-object [data]
-  (new JsonObject data))
+(set! *warn-on-reflection* true)
+(defn ^Map str-keys [x]
+  (persistent!
+    (reduce-kv
+      (fn [acc k v]
+        (if (string? k)
+          acc
+          (dissoc! acc k)))
+      (transient x)
+      x)))
+
+(defn ^JsonObject json-object [data]
+  (new JsonObject (str-keys data)))
 
 (defn make-system [options]
   (Vertx/vertx (new VertxOptions (json-object options))))
@@ -23,7 +34,7 @@
 (defn process-headers [^MultiMap h]
   (persistent!
     (reduce (fn [acc ^Map$Entry entry]
-              (let [k (.toLowerCase (key entry))
+              (let [k (.toLowerCase ^String (key entry))
                     old (get acc k)]
                 (if old
                   (assoc! acc k (str old "," (val entry)))
@@ -96,62 +107,110 @@
              ;(Optional, java.io.InputStream)
              ;An InputStream for the request body, if present.
              ;:vertx-request vertx-request
+             ::request   vertx-request
              }
             query-string
             (assoc :query-string query-string))
     )
   )
 
-(defn status-headers [ ^HttpClientResponse response]
+(defn status-headers [^HttpClientResponse response]
   {:status  (.statusCode response)
    :headers (process-headers (.headers response))})
 
 (defn ring-response [{:keys [as] :as req} ^HttpClientResponse response]
   (case as
     nil (.map ^Future (.body response)
-               (reify Function
-                 (apply [_  x]
-                   (assoc (status-headers response) :body x)))))
+              (reify Function
+                (apply [_ x]
+                  (assoc (status-headers response) :body x))))
+    :string (.map ^Future (.body response)
+                  (reify Function
+                    (apply [_ x]
+                      (assoc (status-headers response) :body (.getString ^Buffer x 0 (.length ^Buffer x)))))))
   )
+
+(defn ws-handler-handler [^ServerWebSocket ws
+                          f]
+  (let [{:keys [textMessageHandler
+                binaryMessagehandler
+                frameHandler
+                closeHandler
+                pongHandler]
+         :as   handlers} (f ws)]
+    (when textMessageHandler
+      (.textMessageHandler ws
+                           (reify Handler
+                             (handle [_ message]
+                               (textMessageHandler message)
+                               ))))
+    (when binaryMessagehandler
+      (.binaryMessageHandler ws
+                             (reify Handler
+                               (handle [_ message]
+                                 (binaryMessagehandler message)))))
+    (when pongHandler
+      (.pongHandler ws
+                    (reify Handler
+                      (handle [_ message]
+                        (pongHandler message)))))
+    (when frameHandler
+      (.frameHandler ws
+                     (reify Handler
+                       (handle [_ frame]
+                         (frameHandler frame)))))
+    (when closeHandler
+      (.closeHandler ws
+                     (reify Handler
+                       (handle [_ _]
+                         (closeHandler)))))))
+
+(defn upgrade-websocket [ request websocket-handler]
+  (.flatMap (.toWebSocket
+              ^HttpServerRequest (::request request))
+            (reify Function
+              (apply [_ ws]
+                (ws-handler-handler ws websocket-handler)))))
 
 (defn http-server
   ^HttpServer [^Vertx system {:strs [request-handler
-                         invalid-requesthandler
-                         websocket-handler
-                         ] :as options}]
+                                     invalid-requesthandler
+                                     websocket-handler
+                                     ] :as options}]
   (cond-> (.createHttpServer system (new HttpServerOptions (json-object options)))
           websocket-handler
           (.webSocketHandler (reify Handler
-                               (handle [_ request] (websocket-handler request))))
+                               (handle [_ request]
+                                 (ws-handler-handler request websocket-handler))))
           request-handler
           (.requestHandler (reify Handler
                              (handle [_ request]
                                (let [response ^HttpServerResponse (.response ^HttpServerRequest request)
                                      ring-request (ring-request request)
-                                     respond  (fn [{:keys [status headers body]}]
-                                                ;(prn :rsp status)
-                                                (.setStatusCode response (int status))
-                                                (run!
-                                                  (fn [header]
-                                                    (let [v (val header)]
-                                                      (if (sequential? v)
-                                                        (run!
-                                                          (fn [v]
-                                                            (.putHeader response
-                                                                        (key header)
-                                                                        v))
-                                                          v)
-                                                        (.putHeader response
-                                                                    (key header)
-                                                                    v))))
-                                                  headers)
-                                                (if body
-                                                  (.write response body)
-                                                  (.end response)))
+                                     respond (fn [{:keys [status headers body]}]
+                                               ;(prn :rsp status)
+                                               (.setStatusCode response (int status))
+                                               (run!
+                                                 (fn [header]
+                                                   (let [v (val header)]
+                                                     (if (sequential? v)
+                                                       (run!
+                                                         (fn [v]
+                                                           (.putHeader response
+                                                                       ^String (key header)
+                                                                       ^String v))
+                                                         v)
+                                                       (.putHeader response
+                                                                   ^String (key header)
+                                                                   ^String v))))
+                                                 headers)
+                                               (if body
+                                                 (.write response body)
+                                                 (.end response)))
                                      raise (fn [exception]
                                              (.setStatusCode response 500)
                                              (.end response))]
-                                 (request-handler ring-request respond raise)))) )
+                                 (request-handler ring-request respond raise)))))
           invalid-requesthandler
           (.invalidRequestHandler (reify Handler
                                     (handle [_ request] (invalid-requesthandler request))))))
@@ -159,18 +218,29 @@
 (defn http-client [^Vertx system {:strs [] :as options}]
   (.createHttpClient system (new HttpClientOptions (json-object options))))
 
+(defmulti ^Future send-body (fn [body ^HttpClientRequest req] (type body)))
+
+(defmethod send-body String
+  [^String body ^HttpClientRequest req]
+  (.send ^HttpClientRequest req body))
+
 (defn make-request [^HttpClient client req]
   (.flatMap (.request client (new RequestOptions (json-object req)))
             (reify Function
-              (apply [_  x]
+              (apply [_ x]
                 ;(prn x)
                 (let [rsp (if-some [body (get req "body")]
-                            (.send ^HttpClientRequest x body)
+                            (send-body body x)
                             (.send ^HttpClientRequest x))]
                   (.flatMap rsp
-                        (reify Function
-                          (apply [_  x]
-                            (ring-response req x)))))))))
+                            (reify Function
+                              (apply [_ x]
+                                (ring-response req x)))))))))
+
+(defn make-ws [^HttpClient client req]
+  (.webSocket client (new WebSocketConnectOptions (json-object req))))
+
+
 
 (defn get-context ^Context []
   (Vertx/currentContext))
@@ -178,17 +248,50 @@
 (defn get-system ^Vertx []
   (.owner (get-context)))
 
+
+
 (comment
   (def vs (make-system {}))
-  (def s (http-server vs {"request-handler" (fn [req respond raise]
-                                              ;(prn :hi req)
-                                              (respond {:status 200}))}))
+  (def ws-handler (fn [^ServerWebSocket ws]
+                    (prn :ws ws)
+                    {:textMessageHandler
+                     (fn [^String message]
+                       (prn :strmsg message)
+                       )
+                     :binaryMessagehandler
+                     (fn [^Buffer message]
+                       (prn :binmsg message)
+                       )
+                     ;:frameHandler
+                     :closeHandler
+                     (fn []
+                       (prn :close))
+                     ;:pongHandler
+                     }))
+  (def s (http-server
+           vs
+           {"request-handler" (fn [req respond raise]
+                                (prn :hi req)
+                                (if (= "websocket" (-> req :headers (get "upgrade")))
+                                  (upgrade-websocket req ws-handler)
+                                  (respond {:status 200})))
+            #_"websocket-handler"}))
   (def client (http-client vs {}))
 
-  (time @(.toCompletionStage (make-request client {"port" 8080})))
+  (time @(.toCompletionStage (make-request client {"port" 8080
+                                                   :as    :string})))
 
   (def running-server @(.toCompletionStage (.listen s 8080)))
   @(.toCompletionStage (.close s))
+
+  (def ws-request @(.toCompletionStage (make-ws client {"port" 8080
+                                                        :as    :string})))
+
+  @(.toCompletionStage (.writePing ws-request (Buffer/buffer "")))
+  @(.toCompletionStage (.writeTextMessage ws-request "hi there server"))
+
+  @(.toCompletionStage *1)
+  @(.toCompletionStage (.close ws-request))
 
   )
 

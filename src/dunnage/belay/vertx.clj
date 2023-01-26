@@ -172,6 +172,36 @@
               (apply [_ ws]
                 (ws-handler-handler ws websocket-handler)))))
 
+(defn make-request-handler [request-handler]
+  (reify Handler
+    (handle [_ request]
+      (let [response ^HttpServerResponse (.response ^HttpServerRequest request)
+            ring-request (ring-request request)
+            respond (fn [{:keys [status headers body]}]
+                      ;(prn :rsp status)
+                      (.setStatusCode response (int status))
+                      (run!
+                        (fn [header]
+                          (let [v (val header)]
+                            (if (sequential? v)
+                              (run!
+                                (fn [v]
+                                  (.putHeader response
+                                              ^String (key header)
+                                              ^String v))
+                                v)
+                              (.putHeader response
+                                          ^String (key header)
+                                          ^String v))))
+                        headers)
+                      (if body
+                        (.write response body)
+                        (.end response)))
+            raise (fn [exception]
+                    (.setStatusCode response 500)
+                    (.end response))]
+        (request-handler ring-request respond raise)))))
+
 (defn http-server
   ^HttpServer [^Vertx system {:strs [request-handler
                                      invalid-requesthandler
@@ -183,34 +213,7 @@
                                (handle [_ request]
                                  (ws-handler-handler request websocket-handler))))
           request-handler
-          (.requestHandler (reify Handler
-                             (handle [_ request]
-                               (let [response ^HttpServerResponse (.response ^HttpServerRequest request)
-                                     ring-request (ring-request request)
-                                     respond (fn [{:keys [status headers body]}]
-                                               ;(prn :rsp status)
-                                               (.setStatusCode response (int status))
-                                               (run!
-                                                 (fn [header]
-                                                   (let [v (val header)]
-                                                     (if (sequential? v)
-                                                       (run!
-                                                         (fn [v]
-                                                           (.putHeader response
-                                                                       ^String (key header)
-                                                                       ^String v))
-                                                         v)
-                                                       (.putHeader response
-                                                                   ^String (key header)
-                                                                   ^String v))))
-                                                 headers)
-                                               (if body
-                                                 (.write response body)
-                                                 (.end response)))
-                                     raise (fn [exception]
-                                             (.setStatusCode response 500)
-                                             (.end response))]
-                                 (request-handler ring-request respond raise)))))
+          (.requestHandler (make-request-handler request-handler))
           invalid-requesthandler
           (.invalidRequestHandler (reify Handler
                                     (handle [_ request] (invalid-requesthandler request))))))
